@@ -1,0 +1,21 @@
+name: Demo Deploy & Instana Release Marker
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy_and_notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Demo Deploy Step
+        run: echo "Deploying demo app..."
+
+      - name: Send Instana Release Marker
+        run: |
+          TIMESTAMP=$(date +%s%3N)
+          curl --fail --location --request POST "${{ secrets.INSTANA_BASE_URL }}/api/releases" \
+            --header "Authorization: apiToken ${{ secrets.INSTANA_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data "{\"name\": \"${{ github.repository }} - ${GITHUB_SHA::7}\", \"start\": ${TIMESTAMP}}"

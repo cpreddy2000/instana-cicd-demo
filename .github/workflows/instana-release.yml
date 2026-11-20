@@ -1,4 +1,4 @@
-name: Demo Deploy & Instana Release Marker
+name: Demo Deploy, Release Marker & Synthetic Check
 
 on:
   push:
@@ -19,3 +19,60 @@ jobs:
             --header "Authorization: apiToken ${{ secrets.INSTANA_API_TOKEN }}" \
             --header "Content-Type: application/json" \
             --data "{\"name\": \"${{ github.repository }} - ${GITHUB_SHA::7}\", \"start\": ${TIMESTAMP}}"
+
+      - name: Run Instana On-Demand Synthetic Test
+        env:
+          BASE_URL: ${{ secrets.INSTANA_BASE_URL }}
+          API_TOKEN: ${{ secrets.INSTANA_API_TOKEN }}
+          TEST_ID: Nj3Rvla6qb2bpJvbZmyR
+        run: |
+          # 1. Fetch the test's configured Location ID
+          TEST_INFO=$(curl -sS -H "authorization: apiToken $API_TOKEN" "$BASE_URL/api/synthetics/settings/tests/$TEST_ID")
+          LOCATION_ID=$(echo "$TEST_INFO" | jq -r '.locations[0]')
+          echo "Using Location ID: $LOCATION_ID"
+
+          if [ -z "$LOCATION_ID" ] || [ "$LOCATION_ID" = "null" ]; then
+            echo "Could not read location ID. API response: $TEST_INFO"
+            exit 1
+          fi
+
+          # 2. Trigger On-Demand Synthetic Test
+          TRIGGER_RESP=$(curl -sS -X POST -H "Content-Type: application/json" \
+            -H "authorization: apiToken $API_TOKEN" \
+            "$BASE_URL/api/synthetics/settings/tests/ci-cd" \
+            -d "[{\"testId\":\"$TEST_ID\",\"customization\":{\"locations\":[\"$LOCATION_ID\"],\"configuration\":{\"timeout\":\"2m\",\"retries\":0}}}]")
+          echo "Trigger response: $TRIGGER_RESP"
+
+          RESULT_ID=$(echo "$TRIGGER_RESP" | jq -r '.[0].testResultId')
+          if [ -z "$RESULT_ID" ] || [ "$RESULT_ID" = "null" ]; then
+            echo "Failed to start synthetic test."
+            exit 1
+          fi
+
+          # 3. Poll until the test completes
+          for i in $(seq 1 24); do
+            STATUS=$(curl -sS -H "Content-Type: application/json" \
+              -H "authorization: apiToken $API_TOKEN" \
+              "$BASE_URL/api/synthetics/settings/tests/ci-cd/$RESULT_ID")
+            COMPLETED=$(echo "$STATUS" | jq -r '.completed')
+            echo "Attempt $i: completed=$COMPLETED"
+            if [ "$COMPLETED" = "true" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          # 4. Fetch test result errors and fail build if any errors exist
+          RESULTS=$(curl -sS -X POST -H "Content-Type: application/json" \
+            -H "authorization: apiToken $API_TOKEN" \
+            "$BASE_URL/api/synthetics/results/list" \
+            -d "{\"syntheticMetrics\":[\"errors\"],\"tagFilterExpression\":{\"elements\":[{\"stringValue\":\"OnDemand\",\"name\":\"synthetic.runType\",\"operator\":\"EQUALS\"},{\"elements\":[{\"stringValue\":\"$RESULT_ID\",\"name\":\"id\",\"operator\":\"EQUALS\"}],\"logicalOperator\":\"OR\",\"type\":\"EXPRESSION\"}],\"logicalOperator\":\"AND\",\"type\":\"EXPRESSION\"},\"pagination\":{\"page\":1,\"pageSize\":5},\"timeFrame\":{\"to\":0,\"windowSize\":14400000}}")
+          echo "Results: $RESULTS"
+
+          ERROR_COUNT=$(echo "$RESULTS" | jq '.items[0].testResultCommonProperties.errors | length')
+          echo "Error count: $ERROR_COUNT"
+          if [ "$ERROR_COUNT" -gt 0 ]; then
+            echo "Synthetic test failed!"
+            exit 1
+          fi
+          echo "Synthetic test passed!"
